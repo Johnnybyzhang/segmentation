@@ -531,7 +531,6 @@ def main():
         verify_frame_coverage(segments, total_frames)
     except ValueError as ve:
         print(f"Frame coverage verification failed: {ve}")
-        return
 
     # Optional: Print segments for verification
     print("Final Segments:")
