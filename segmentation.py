@@ -282,18 +282,44 @@ def purge_short_animation_segments(segments: List[Segment]) -> List[Segment]:
             # Assign f2 to the next 'still' segment
             if (i + 1) < len(segments) and segments[i + 1].segment_type == 'still':
                 next_seg = segments[i + 1]
-                # Create a new 'still' segment starting at f2 and ending at next_seg.end_frame
-                new_segments.append(Segment('still', f2, next_seg.end_frame))
+                # Modify the next 'still' segment's start_frame to f2
+                modified_next_seg = Segment('still', f2, next_seg.end_frame)
+                new_segments.append(modified_next_seg)
                 i += 1  # Skip the next segment as it's handled
             else:
                 # If no next 'still' segment, create a new one for f2
                 new_segments.append(Segment('still', f2, f2))
-            i += 1  # Skip the animation segment
         else:
             # Keep the segment as is
             new_segments.append(seg)
-        i += 1
+        i += 1  # Only increment once per loop iteration
     return new_segments
+
+
+def verify_frame_coverage(segments: List[Segment], total_frames: int):
+    """
+    Verify that all frames in the video are covered by the segments without gaps or overlaps.
+
+    Args:
+        segments: List of finalized segments.
+        total_frames: Total number of frames in the video.
+
+    Raises:
+        ValueError: If there are missing or overlapping frames.
+    """
+    covered_frames = set()
+    for seg in segments:
+        for frame in range(seg.start_frame, seg.end_frame + 1):
+            if frame in covered_frames:
+                raise ValueError(f"Overlapping frames detected at frame {frame}.")
+            covered_frames.add(frame)
+
+    missing_frames = set(range(total_frames)) - covered_frames
+    if missing_frames:
+        missing_frames_sorted = sorted(missing_frames)
+        print(f"Missing frames: {missing_frames_sorted}")
+    else:
+        print("All frames are covered in the segments.")
 
 
 def map_segments_to_timestamps(segments: List[Segment], fps: float):
@@ -377,7 +403,7 @@ def main():
         "--threshold",
         type=float,
         default=0.0001,
-        help="Similarity threshold as a fraction (e.g., 0.0001 for 0.01%).",
+        help="Similarity threshold as a fraction (e.g., 0.0001 for 0.01%%).",
     )
     parser.add_argument(
         "-p",
@@ -499,6 +525,13 @@ def main():
     segments = purge_short_animation_segments(segments)
 
     print(f"Identified {len(segments)} segments.\n")
+
+    # Verify frame coverage
+    try:
+        verify_frame_coverage(segments, total_frames)
+    except ValueError as ve:
+        print(f"Frame coverage verification failed: {ve}")
+        return
 
     # Optional: Print segments for verification
     print("Final Segments:")
