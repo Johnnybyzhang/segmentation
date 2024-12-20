@@ -3,9 +3,9 @@ import cv2
 import subprocess
 import argparse
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 from concurrent.futures import ProcessPoolExecutor
-from tqdm import tqdm  # Import tqdm for progress bars
+from tqdm import tqdm
 
 @dataclass
 class Segment:
@@ -14,7 +14,6 @@ class Segment:
     end_frame: int
 
 def get_video_properties(video_path: str):
-    """Retrieve video properties like framerate and total frame count."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video file: {video_path}")
@@ -27,105 +26,113 @@ def get_video_properties(video_path: str):
     cap.release()
     return fps, total_frames
 
-def load_all_frames(video_path: str, total_frames: int):
-    """Load all frames into memory as a list of numpy arrays."""
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Cannot open video file: {video_path}")
-
-    frames = []
-    # Initialize tqdm progress bar for frame loading
-    with tqdm(total=total_frames, desc="Loading Frames", unit="frame") as pbar:
-        for _ in range(total_frames):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(frame)
-            pbar.update(1)
-    cap.release()
-
-    if len(frames) != total_frames:
-        raise ValueError("Could not read all frames from the video.")
-    return frames
-
 def compare_two_frames(args):
-    """Compare two frames for exact equality. args is a tuple (frame1, frame2)."""
+    """Compare two frames (frame1, frame2) for exact equality."""
     frame1, frame2 = args
     return (frame1 == frame2).all()
 
-def segment_video(frames) -> List[Segment]:
+def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, executor):
     """
-    Given a list of frames, identify still and animation segments.
-    We assume frames is a list of numpy arrays of the same shape.
+    Process a single chunk of frames:
+    - frames: List of frames read in this chunk
+    - prev_frame: The last frame from the previous chunk (None if this is the first chunk)
+    - prev_frame_index: The frame index of prev_frame in the global sequence
+    - start_frame_index: The index of the first frame in this chunk
+    - executor: A ProcessPoolExecutor for parallel comparisons
+
+    Returns:
+    - results: List of booleans for each comparison in this chunk (including prev_frame if provided)
+    - last_frame_index: The index of the last frame in this chunk
     """
-    # Create list of frame pairs for comparison
-    frame_pairs = [(frames[i], frames[i+1]) for i in range(len(frames)-1)]
+    if prev_frame is not None:
+        combined_frames = [prev_frame] + frames
+    else:
+        combined_frames = frames
 
-    # Use multiprocessing to speed up comparison
-    results = []
-    with ProcessPoolExecutor() as executor:
-        # Initialize tqdm progress bar for frame comparison
-        with tqdm(total=len(frame_pairs), desc="Comparing Frames", unit="comparison") as pbar:
-            for result in executor.map(compare_two_frames, frame_pairs):
-                results.append(result)
-                pbar.update(1)
+    # Prepare frame pairs
+    frame_pairs = [(combined_frames[i], combined_frames[i+1]) for i in range(len(combined_frames)-1)]
 
-    # Now build segments from the comparison results
-    segments = []
-    current_segment_start = 0
-    current_segment_type = None
+    # Parallel comparison
+    results = list(executor.map(compare_two_frames, frame_pairs))
+
+    last_frame_index = start_frame_index + len(frames) - 1
+    return results, last_frame_index
+
+def update_segments(segments: List[Segment], results: List[bool], prev_frame_index: Optional[int], start_frame_index: int,
+                    current_segment_type: Optional[str], current_segment_start: Optional[int]):
+    """
+    Update segments based on the results of a chunk.
+    results: boolean list of comparisons
+    prev_frame_index: The index of the frame before the first frame in this chunk (None if none)
+    start_frame_index: The index of the first frame in this chunk
+    current_segment_type, current_segment_start: segment state carried over from previous chunks
+
+    Returns updated segments, current_segment_type, current_segment_start.
+    """
+    # The indexing of frames for results:
+    # If prev_frame_index is not None:
+    #   results[0] compares prev_frame_index and start_frame_index
+    #   results[1] compares start_frame_index and start_frame_index+1
+    #   ...
+    # If prev_frame_index is None (first chunk):
+    #   results[0] compares start_frame_index and start_frame_index+1
+    #   results[i] compares (start_frame_index+i) and (start_frame_index+i+1)
 
     for i, identical in enumerate(results):
-        if identical:
-            # Frames i and i+1 are identical
-            if current_segment_type == 'animation':
-                # Close the current animation segment
-                segments.append(Segment(
-                    segment_type='animation',
-                    start_frame=current_segment_start,
-                    end_frame=i
-                ))
-                # Start a still segment
-                current_segment_start = i
-                current_segment_type = 'still'
-            elif current_segment_type is None:
-                # Start from the beginning as still
-                current_segment_type = 'still'
-            # If already 'still', just continue
+        if prev_frame_index is not None:
+            # The pair of frames for results[i]:
+            # difference i=0: (prev_frame_index, start_frame_index)
+            # difference i>0: (start_frame_index+(i-1), start_frame_index+i)
+            if i == 0:
+                f1 = prev_frame_index
+                f2 = start_frame_index
+            else:
+                f1 = start_frame_index + (i - 1)
+                f2 = start_frame_index + i
         else:
-            # Frames differ
+            # No prev frame:
+            # results[i]: (start_frame_index+i, start_frame_index+i+1)
+            f1 = start_frame_index + i
+            f2 = start_frame_index + i + 1
+
+        # Update segments logic
+        if identical:
+            # frames f1 and f2 are identical
+            if current_segment_type == 'animation':
+                # Close the animation segment at f1
+                segments.append(Segment(segment_type='animation', start_frame=current_segment_start, end_frame=f1))
+                current_segment_start = f1
+                current_segment_type = 'still'
+            elif current_segment_type is None:
+                current_segment_type = 'still'
+        else:
+            # frames differ
             if current_segment_type == 'still':
-                # Close the current still segment
-                segments.append(Segment(
-                    segment_type='still',
-                    start_frame=current_segment_start,
-                    end_frame=i
-                ))
-                # Start an animation segment
-                current_segment_start = i
+                # Close the still segment at f1
+                segments.append(Segment(segment_type='still', start_frame=current_segment_start, end_frame=f1))
+                current_segment_start = f1
                 current_segment_type = 'animation'
             elif current_segment_type is None:
-                # Start as animation
                 current_segment_type = 'animation'
-            # If already 'animation', just continue
 
-    # Close the last segment
-    last_frame_index = len(frames) - 1
+    return segments, current_segment_type, current_segment_start
+
+def finalize_segments(segments: List[Segment], current_segment_type: Optional[str], current_segment_start: Optional[int], last_frame_index: int):
+    """
+    Close the last open segment after processing all chunks.
+    """
     if current_segment_type is not None:
         segments.append(Segment(
             segment_type=current_segment_type,
             start_frame=current_segment_start,
             end_frame=last_frame_index
         ))
-
     return segments
 
 def map_segments_to_timestamps(segments: List[Segment], fps: float):
-    """Convert frame indices to timestamps based on framerate."""
     mapped_segments = []
     for seg in segments:
         start_time = seg.start_frame / fps
-        # end_frame is inclusive, so we add 1 frame's duration
         duration = (seg.end_frame - seg.start_frame + 1) / fps
         mapped_segments.append({
             'type': seg.segment_type,
@@ -135,11 +142,9 @@ def map_segments_to_timestamps(segments: List[Segment], fps: float):
     return mapped_segments
 
 def cut_segments_with_ffmpeg(video_path: str, segments: List[dict], output_dir: str):
-    """Use ffmpeg to cut the video into segments without re-encoding."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # Initialize tqdm progress bar for cutting segments
     with tqdm(total=len(segments), desc="Cutting Segments", unit="segment") as pbar:
         for idx, seg in enumerate(segments):
             segment_type = seg['type']
@@ -149,7 +154,7 @@ def cut_segments_with_ffmpeg(video_path: str, segments: List[dict], output_dir: 
 
             cmd = [
                 "ffmpeg",
-                "-y",  # Overwrite output files without asking
+                "-y",
                 "-i", video_path,
                 "-ss", f"{start_time:.3f}",
                 "-t", f"{duration:.3f}",
@@ -157,26 +162,23 @@ def cut_segments_with_ffmpeg(video_path: str, segments: List[dict], output_dir: 
                 out_file
             ]
 
-            # Optional: You can comment out the next line if you don't want to see the ffmpeg commands
-            # print(f"Running command: {' '.join(cmd)}")
             try:
                 subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                # Optionally, you can print the progress
-                # print(f"Segment saved to: {out_file}")
             except subprocess.CalledProcessError as e:
                 print(f"Error processing segment {idx}: {e.stderr.decode()}")
                 print("Skipping this segment.")
-            finally:
-                pbar.update(1)
+            pbar.update(1)
 
 def main():
-    parser = argparse.ArgumentParser(description="Segment video into still and animation parts with progress bars.")
+    parser = argparse.ArgumentParser(description="Segment video into still and animation parts in chunks.")
     parser.add_argument("video", help="Path to the input video file.")
     parser.add_argument("-o", "--output", default="cuts", help="Output directory for segments.")
+    parser.add_argument("-c", "--chunk-size", type=int, default=512, help="Number of frames to process per chunk.")
     args = parser.parse_args()
 
     video_path = args.video
     output_dir = args.output
+    chunk_size = args.chunk_size
 
     if not os.path.isfile(video_path):
         print(f"Error: File '{video_path}' does not exist.")
@@ -192,20 +194,65 @@ def main():
         print(f"Error retrieving video properties: {e}")
         return
 
-    print("Loading all frames into memory...")
-    try:
-        frames = load_all_frames(video_path, total_frames)
-    except Exception as e:
-        print(f"Error loading frames: {e}")
+    # Open video capture
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Cannot open video file: {video_path}")
         return
 
-    print("Segmenting video based on frame differences...")
-    try:
-        segments = segment_video(frames)
-        print(f"Identified {len(segments)} segments.\n")
-    except Exception as e:
-        print(f"Error during segmentation: {e}")
-        return
+    total_comparisons = max(0, total_frames - 1)  # number of frame-to-frame comparisons
+    segments = []
+    current_segment_type = None
+    current_segment_start = None
+
+    prev_frame = None
+    prev_frame_index = None
+
+    frame_index = 0
+    with ProcessPoolExecutor() as executor:
+        with tqdm(total=total_comparisons, desc="Comparing Frames", unit="comparison") as pbar:
+            while True:
+                # Read up to chunk_size frames
+                frames = []
+                for _ in range(chunk_size):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frames.append(frame)
+
+                if len(frames) == 0:
+                    # No more frames
+                    break
+
+                # Process this chunk
+                chunk_start_frame = frame_index
+                results, last_frame_index = process_chunk(frames, prev_frame, prev_frame_index, chunk_start_frame, executor)
+
+                # Update segments with these results
+                segments, current_segment_type, current_segment_start = update_segments(
+                    segments, 
+                    results, 
+                    prev_frame_index, 
+                    chunk_start_frame,
+                    current_segment_type, 
+                    current_segment_start
+                )
+
+                # Update progress bar
+                pbar.update(len(results))
+
+                # Prepare for next chunk
+                prev_frame = frames[-1]
+                prev_frame_index = last_frame_index
+                frame_index = last_frame_index + 1
+
+    cap.release()
+
+    # Finalize segments
+    if total_frames > 0:
+        segments = finalize_segments(segments, current_segment_type, current_segment_start, total_frames - 1)
+
+    print(f"Identified {len(segments)} segments.\n")
 
     print("Mapping segments to timestamps...")
     mapped_segments = map_segments_to_timestamps(segments, fps)
