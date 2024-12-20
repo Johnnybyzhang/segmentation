@@ -5,7 +5,7 @@ import subprocess
 import argparse
 from dataclasses import dataclass
 from typing import List, Optional
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 @dataclass
@@ -27,22 +27,22 @@ def get_video_properties(video_path: str):
     cap.release()
     return fps, total_frames
 
-def compare_two_frames(args):
-    """Compare two frames (frame1, frame2) for exact equality."""
-    frame1, frame2 = args
+def compare_two_frames(frame1, frame2):
+    """Compare two frames for exact equality."""
     return (frame1 == frame2).all()
 
-def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, executor):
+def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, executor, workers):
     """
-    Process a single chunk of frames:
+    Process a single chunk of frames in parallel:
     - frames: List of frames read in this chunk
-    - prev_frame: The last frame from the previous chunk (None if this is the first chunk)
+    - prev_frame: The last frame from the previous chunk (None if first chunk)
     - prev_frame_index: The frame index of prev_frame in the global sequence
     - start_frame_index: The index of the first frame in this chunk
     - executor: A ProcessPoolExecutor for parallel comparisons
+    - workers: number of parallel workers (for informational prints)
 
     Returns:
-    - results: List of booleans for each comparison in this chunk (including the prev_frame if provided)
+    - results: List of booleans for each comparison in this chunk
     - last_frame_index: The index of the last frame in this chunk
     """
     if prev_frame is not None:
@@ -50,15 +50,22 @@ def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, execu
     else:
         combined_frames = frames
 
-    # Prepare frame pairs
+    # Prepare frame pairs (each will be processed in parallel)
     frame_pairs = [(combined_frames[i], combined_frames[i+1]) for i in range(len(combined_frames)-1)]
+    n_pairs = len(frame_pairs)
 
-    # Parallel comparison with a progress bar for just this chunk
-    # The length of frame_pairs is equal to len(frames) + (1 if prev_frame is not None else 0) - 1
-    with tqdm(total=len(frame_pairs), desc="Comparing chunk frames", unit="comparison", leave=False) as pbar:
+    # Submit tasks to the executor
+    futures = []
+    with tqdm(total=n_pairs, desc="Comparing chunk frames", unit="comparison", leave=False) as pbar:
+        for f1, f2 in frame_pairs:
+            future = executor.submit(compare_two_frames, f1, f2)
+            futures.append(future)
+
         results = []
-        for result in executor.map(compare_two_frames, frame_pairs):
-            results.append(result)
+        # As tasks complete, update the progress bar
+        for f in as_completed(futures):
+            res = f.result()
+            results.append(res)
             pbar.update(1)
 
     last_frame_index = start_frame_index + len(frames) - 1
@@ -68,16 +75,9 @@ def update_segments(segments: List[Segment], results: List[bool], prev_frame_ind
                     current_segment_type: Optional[str], current_segment_start: Optional[int]):
     """
     Update segments based on the results of a chunk.
-    results: boolean list of comparisons
-    prev_frame_index: The index of the frame before this chunk (None if first chunk)
-    start_frame_index: The index of the first frame in this chunk
-    current_segment_type, current_segment_start: segment state carried over from previous chunks
-
-    Returns updated segments, current_segment_type, current_segment_start.
     """
     for i, identical in enumerate(results):
         if prev_frame_index is not None:
-            # results indexing:
             # i=0: compares prev_frame_index and start_frame_index
             # i>0: compares start_frame_index+(i-1) and start_frame_index+i
             if i == 0:
@@ -88,11 +88,10 @@ def update_segments(segments: List[Segment], results: List[bool], prev_frame_ind
                 f2 = start_frame_index + i
         else:
             # If no prev_frame_index:
-            # results[i]: compares (start_frame_index+i) and (start_frame_index+i+1)
+            # results[i] compares (start_frame_index+i) and (start_frame_index+i+1)
             f1 = start_frame_index + i
             f2 = start_frame_index + i + 1
 
-        # Segment logic
         if identical:
             # frames f1 and f2 are identical
             if current_segment_type == 'animation':
@@ -167,15 +166,17 @@ def cut_segments_with_ffmpeg(video_path: str, segments: List[dict], output_dir: 
             pbar.update(1)
 
 def main():
-    parser = argparse.ArgumentParser(description="Segment video into still and animation parts in chunks.")
+    parser = argparse.ArgumentParser(description="Segment video into still and animation parts with parallel processing.")
     parser.add_argument("video", help="Path to the input video file.")
     parser.add_argument("-o", "--output", default="cuts", help="Output directory for segments.")
     parser.add_argument("-c", "--chunk-size", type=int, default=512, help="Number of frames to process per chunk.")
+    parser.add_argument("-w", "--workers", type=int, default=16, help="Number of parallel workers for frame comparison.")
     args = parser.parse_args()
 
     video_path = args.video
     output_dir = args.output
     chunk_size = args.chunk_size
+    workers = args.workers
 
     if not os.path.isfile(video_path):
         print(f"Error: File '{video_path}' does not exist.")
@@ -207,21 +208,21 @@ def main():
 
     prev_frame = None
     prev_frame_index = None
-
     frame_index = 0
 
-    with ProcessPoolExecutor() as executor:
+    print(f"Using {workers} workers for parallel frame comparisons.")
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
         for chunk_number in range(num_chunks):
             # Calculate chunk boundaries
             chunk_start_frame = frame_index
             chunk_end_frame = min(chunk_start_frame + chunk_size - 1, total_frames - 1)
             this_chunk_size = (chunk_end_frame - chunk_start_frame + 1)
 
-            # Calculate global progress
             global_progress = (chunk_number + 1) / num_chunks * 100
             print(f"Processing chunk {chunk_number+1} out of {num_chunks}, total progress: {global_progress:.2f}%")
 
-            # Load frames for this chunk with a progress bar
+            # Load frames for this chunk
             frames = []
             with tqdm(total=this_chunk_size, desc="Loading chunk frames", unit="frame", leave=False) as pbar:
                 for _ in range(this_chunk_size):
@@ -235,8 +236,8 @@ def main():
                 # No more frames
                 break
 
-            # Process this chunk
-            results, last_frame_index = process_chunk(frames, prev_frame, prev_frame_index, chunk_start_frame, executor)
+            # Process this chunk in parallel
+            results, last_frame_index = process_chunk(frames, prev_frame, prev_frame_index, chunk_start_frame, executor, workers)
 
             # Update segments with these results
             segments, current_segment_type, current_segment_start = update_segments(
@@ -253,7 +254,7 @@ def main():
             prev_frame_index = last_frame_index
             frame_index = last_frame_index + 1
 
-            # Release memory by clearing frames and results references
+            # Release memory
             frames = None
             results = None
 
@@ -274,4 +275,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
