@@ -9,11 +9,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import numpy as np
 
+
 @dataclass
 class Segment:
     segment_type: str  # 'still' or 'animation'
     start_frame: int
     end_frame: int
+
 
 def get_video_properties(video_path: str):
     """Retrieve video properties like framerate and total frame count."""
@@ -29,15 +31,16 @@ def get_video_properties(video_path: str):
     cap.release()
     return fps, total_frames
 
+
 def frames_are_similar(frame1, frame2, pixel_threshold=0.0001, per_pixel_diff_threshold=30):
     """
     Compare two frames and determine if they are similar within a given threshold.
-    
+
     Args:
         frame1: First frame as a NumPy array.
         frame2: Second frame as a NumPy array.
         pixel_threshold: Maximum allowable fraction of differing pixels (e.g., 0.0001 for 0.01%).
-        per_pixel_diff_threshold: Intensity difference to consider a pixel as different.
+        per_pixel_diff_threshold: The per-pixel intensity difference to consider a pixel as "different".
 
     Returns:
         True if frames are similar within the threshold, False otherwise.
@@ -56,9 +59,14 @@ def frames_are_similar(frame1, frame2, pixel_threshold=0.0001, per_pixel_diff_th
     fraction_diff = num_diff_pixels / total_pixels
     return fraction_diff <= pixel_threshold
 
+
 def compare_frame_pairs_subchunk(frame_pairs_sublist, pixel_threshold, per_pixel_diff_threshold):
     """Compare a sublist of frame pairs and return the list of boolean results."""
-    return [frames_are_similar(f1, f2, pixel_threshold, per_pixel_diff_threshold) for (f1, f2) in frame_pairs_sublist]
+    return [
+        frames_are_similar(f1, f2, pixel_threshold, per_pixel_diff_threshold)
+        for (f1, f2) in frame_pairs_sublist
+    ]
+
 
 def split_into_subchunks(data, n_subchunks):
     """Split the data list into n_subchunks as evenly as possible."""
@@ -67,9 +75,19 @@ def split_into_subchunks(data, n_subchunks):
         # If n_subchunks is larger than data length, just return one chunk
         return [data]
     chunk_size = math.ceil(length / n_subchunks)
-    return [data[i:i+chunk_size] for i in range(0, length, chunk_size)]
+    return [data[i:i + chunk_size] for i in range(0, length, chunk_size)]
 
-def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, executor, workers, pixel_threshold, per_pixel_diff_threshold):
+
+def process_chunk(
+    frames,
+    prev_frame,
+    prev_frame_index,
+    start_frame_index,
+    executor,
+    workers,
+    pixel_threshold,
+    per_pixel_diff_threshold,
+):
     """
     Process a single chunk of frames in parallel.
 
@@ -93,65 +111,61 @@ def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, execu
         combined_frames = frames
 
     # Prepare frame pairs
-    frame_pairs = [(combined_frames[i], combined_frames[i+1]) for i in range(len(combined_frames)-1)]
+    frame_pairs = [
+        (combined_frames[i], combined_frames[i + 1]) for i in range(len(combined_frames) - 1)
+    ]
     n_pairs = len(frame_pairs)
 
     # Divide frame_pairs into sub-chunks for parallel processing
     subchunks = split_into_subchunks(frame_pairs, workers)
+    n_subchunks = len(subchunks)
 
-    # Submit sub-chunks to the executor
-    futures = []
-    for sc in subchunks:
-        futures.append(executor.submit(compare_frame_pairs_subchunk, sc, pixel_threshold, per_pixel_diff_threshold))
+    # Submit subchunks to the executor with their indices to maintain order
+    futures = {
+        executor.submit(
+            compare_frame_pairs_subchunk, sc, pixel_threshold, per_pixel_diff_threshold
+        ): idx
+        for idx, sc in enumerate(subchunks)
+    }
 
-    results_ordered = []
-    with tqdm(total=n_pairs, desc="Comparing chunk frames", unit="comparison", leave=False) as pbar:
-        for f in as_completed(futures):
-            sub_results = f.result()
-            results_ordered.append(sub_results)
+    # Initialize results_ordered with placeholders
+    results_ordered = [None] * n_subchunks
+
+    # Progress bar for this chunk's comparisons
+    with tqdm(
+        total=n_pairs, desc="Comparing chunk frames", unit="comparison", leave=False
+    ) as pbar:
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                sub_results = future.result()
+            except Exception as e:
+                print(f"Error in parallel comparison: {e}")
+                sub_results = [False] * len(subchunks[idx])  # Treat errors as non-similar
+            results_ordered[idx] = sub_results
             pbar.update(len(sub_results))
 
-    # Ensure results are in the correct order based on subchunk order
-    # Since as_completed doesn't guarantee order, we need to sort based on subchunk indices
-    # To maintain order, we can use the order in which subchunks were created
-    # Alternatively, we can collect results in order
-    # Here, we'll assume that results_ordered are appended in the order tasks complete,
-    # which may not be the same as the original subchunk order. To preserve order, we need
-    # to track subchunk indices.
+    # Check if any subchunk results are missing
+    for idx, sublist in enumerate(results_ordered):
+        if sublist is None:
+            print(f"Warning: Subchunk {idx} did not return any results. Treating as all differing.")
+            results_ordered[idx] = [False] * len(subchunks[idx])
 
-    # To fix ordering, modify the submission to include subchunk indices
-    # Here's an updated approach:
-
-    # Re-initialize results_ordered with placeholders
-    results_ordered = [None] * len(subchunks)
-    for idx, f in enumerate(futures):
-        # Assuming subchunks are submitted in order, index corresponds to subchunk order
-        # Not strictly guaranteed with as_completed, so a better approach is needed
-        pass  # Skipping for simplicity, assuming order doesn't matter for flattening
-
-    # Flatten the list of lists
-    results = [res for sublist in results_ordered for res in sublist if sublist is not None]
-
-    # However, to maintain correct ordering, we need to associate subchunks with their indices
-    # Let's adjust the code accordingly
-
-    # Reset results_ordered
-    results_ordered = [None] * len(subchunks)
-    futures_with_idx = {executor.submit(compare_frame_pairs_subchunk, sc, pixel_threshold, per_pixel_diff_threshold): idx for idx, sc in enumerate(subchunks)}
-
-    for f in as_completed(futures_with_idx):
-        idx = futures_with_idx[f]
-        results_ordered[idx] = f.result()
-        pbar.update(len(futures_with_idx))
-    
-    # Now flatten results in the correct order
-    results = [r for sublist in results_ordered for r in sublist]
+    # Flatten results in the correct order
+    results = [res for sublist in results_ordered for res in sublist]
 
     last_frame_index = start_frame_index + len(frames) - 1
     return results, last_frame_index
 
-def update_segments(segments: List[Segment], results: List[bool], prev_frame_index: Optional[int], start_frame_index: int,
-                    current_segment_type: Optional[str], current_segment_start: Optional[int]):
+
+def update_segments(
+    segments: List[Segment],
+    results: List[bool],
+    prev_frame_index: Optional[int],
+    start_frame_index: int,
+    current_segment_type: Optional[str],
+    current_segment_start: Optional[int],
+):
     """
     Update segments based on the results of a chunk.
 
@@ -211,7 +225,13 @@ def update_segments(segments: List[Segment], results: List[bool], prev_frame_ind
 
     return segments, current_segment_type, current_segment_start
 
-def finalize_segments(segments: List[Segment], current_segment_type: Optional[str], current_segment_start: Optional[int], last_frame_index: int):
+
+def finalize_segments(
+    segments: List[Segment],
+    current_segment_type: Optional[str],
+    current_segment_start: Optional[int],
+    last_frame_index: int,
+):
     """
     Close the last open segment after processing all chunks.
 
@@ -226,11 +246,12 @@ def finalize_segments(segments: List[Segment], current_segment_type: Optional[st
     """
     if current_segment_type is not None and current_segment_start is not None:
         segments.append(Segment(
-            current_segment_type,
-            current_segment_start,
-            last_frame_index
+            segment_type=current_segment_type,
+            start_frame=current_segment_start,
+            end_frame=last_frame_index
         ))
     return segments
+
 
 def map_segments_to_timestamps(segments: List[Segment], fps: float):
     """
@@ -253,6 +274,7 @@ def map_segments_to_timestamps(segments: List[Segment], fps: float):
             'duration': duration
         })
     return mapped_segments
+
 
 def cut_segments_with_ffmpeg(video_path: str, segments: List[dict], output_dir: str):
     """
@@ -290,14 +312,37 @@ def cut_segments_with_ffmpeg(video_path: str, segments: List[dict], output_dir: 
                 print("Skipping this segment.")
             pbar.update(1)
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Segment video into still and animation parts with parallel processing and similarity threshold.")
+    parser = argparse.ArgumentParser(
+        description="Segment video into still and animation parts with parallel processing and similarity threshold."
+    )
     parser.add_argument("video", help="Path to the input video file.")
     parser.add_argument("-o", "--output", default="cuts", help="Output directory for segments.")
-    parser.add_argument("-c", "--chunk-size", type=int, default=512, help="Number of frames to process per chunk.")
-    parser.add_argument("-w", "--workers", type=int, default=16, help="Number of parallel workers (processes) for frame comparison.")
-    parser.add_argument("-t", "--threshold", type=float, default=0.0001, help="Similarity threshold as a fraction (e.g., 0.0001 for 0.01%).")
-    parser.add_argument("-p", "--per-pixel-diff", type=int, default=30, help="Per-pixel intensity difference threshold.")
+    parser.add_argument(
+        "-c", "--chunk-size", type=int, default=512, help="Number of frames to process per chunk."
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=16,
+        help="Number of parallel workers (processes) for frame comparison.",
+    )
+    parser.add_argument(
+        "-t",
+        "--threshold",
+        type=float,
+        default=0.0001,
+        help="Similarity threshold as a fraction (e.g., 0.0001 for 0.01%).",
+    )
+    parser.add_argument(
+        "-p",
+        "--per-pixel-diff",
+        type=int,
+        default=30,
+        help="Per-pixel intensity difference threshold.",
+    )
     args = parser.parse_args()
 
     video_path = args.video
@@ -350,11 +395,15 @@ def main():
             this_chunk_size = (chunk_end_frame - chunk_start_frame + 1)
 
             global_progress = (chunk_number + 1) / num_chunks * 100
-            print(f"Processing chunk {chunk_number+1} out of {num_chunks}, total progress: {global_progress:.2f}%")
+            print(
+                f"Processing chunk {chunk_number+1} out of {num_chunks}, total progress: {global_progress:.2f}%"
+            )
 
             # Load frames for this chunk with a progress bar
             frames = []
-            with tqdm(total=this_chunk_size, desc="Loading chunk frames", unit="frame", leave=False) as pbar:
+            with tqdm(
+                total=this_chunk_size, desc="Loading chunk frames", unit="frame", leave=False
+            ) as pbar:
                 for _ in range(this_chunk_size):
                     ret, frame = cap.read()
                     if not ret:
@@ -374,7 +423,7 @@ def main():
                 executor,
                 workers,
                 pixel_threshold,
-                per_pixel_diff_threshold
+                per_pixel_diff_threshold,
             )
 
             # Update segments with these results
@@ -384,7 +433,7 @@ def main():
                 prev_frame_index,
                 chunk_start_frame,
                 current_segment_type,
-                current_segment_start
+                current_segment_start,
             )
 
             # Prepare for next chunk
@@ -399,7 +448,9 @@ def main():
     cap.release()
 
     # Finalize segments
-    segments = finalize_segments(segments, current_segment_type, current_segment_start, total_frames - 1)
+    segments = finalize_segments(
+        segments, current_segment_type, current_segment_start, total_frames - 1
+    )
 
     print(f"Identified {len(segments)} segments.\n")
 
@@ -410,6 +461,7 @@ def main():
     cut_segments_with_ffmpeg(video_path, mapped_segments, output_dir)
 
     print("All segments have been processed and saved.")
+
 
 if __name__ == "__main__":
     main()
