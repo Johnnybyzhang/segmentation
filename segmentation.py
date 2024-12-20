@@ -4,6 +4,8 @@ import subprocess
 import argparse
 from dataclasses import dataclass
 from typing import List
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm  # Import tqdm for progress bars
 
 @dataclass
 class Segment:
@@ -25,76 +27,97 @@ def get_video_properties(video_path: str):
     cap.release()
     return fps, total_frames
 
-def compare_frames(frame1, frame2):
-    """Compare two frames for exact equality."""
-    return (frame1 == frame2).all()
-
-def segment_video(video_path: str, fps: float, total_frames: int) -> List[Segment]:
-    """Process video frames and identify still and animation segments."""
+def load_all_frames(video_path: str, total_frames: int):
+    """Load all frames into memory as a list of numpy arrays."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video file: {video_path}")
 
+    frames = []
+    # Initialize tqdm progress bar for frame loading
+    with tqdm(total=total_frames, desc="Loading Frames", unit="frame") as pbar:
+        for _ in range(total_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame)
+            pbar.update(1)
+    cap.release()
+
+    if len(frames) != total_frames:
+        raise ValueError("Could not read all frames from the video.")
+    return frames
+
+def compare_two_frames(args):
+    """Compare two frames for exact equality. args is a tuple (frame1, frame2)."""
+    frame1, frame2 = args
+    return (frame1 == frame2).all()
+
+def segment_video(frames) -> List[Segment]:
+    """
+    Given a list of frames, identify still and animation segments.
+    We assume frames is a list of numpy arrays of the same shape.
+    """
+    # Create list of frame pairs for comparison
+    frame_pairs = [(frames[i], frames[i+1]) for i in range(len(frames)-1)]
+
+    # Use multiprocessing to speed up comparison
+    results = []
+    with ProcessPoolExecutor() as executor:
+        # Initialize tqdm progress bar for frame comparison
+        with tqdm(total=len(frame_pairs), desc="Comparing Frames", unit="comparison") as pbar:
+            for result in executor.map(compare_two_frames, frame_pairs):
+                results.append(result)
+                pbar.update(1)
+
+    # Now build segments from the comparison results
     segments = []
     current_segment_start = 0
     current_segment_type = None
 
-    ret, prev_frame = cap.read()
-    if not ret:
-        raise ValueError("Failed to read the first frame from the video.")
-
-    frame_idx = 0
-
-    while True:
-        ret, next_frame = cap.read()
-        if not ret:
-            # End of video; close the last segment
-            if current_segment_type is not None:
-                segments.append(Segment(
-                    segment_type=current_segment_type,
-                    start_frame=current_segment_start,
-                    end_frame=frame_idx
-                ))
-            break
-
-        frame_idx += 1
-
-        if compare_frames(prev_frame, next_frame):
-            # Current frame is identical to the previous frame
+    for i, identical in enumerate(results):
+        if identical:
+            # Frames i and i+1 are identical
             if current_segment_type == 'animation':
                 # Close the current animation segment
                 segments.append(Segment(
                     segment_type='animation',
                     start_frame=current_segment_start,
-                    end_frame=frame_idx - 1
+                    end_frame=i
                 ))
-                # Start a new still segment
-                current_segment_start = frame_idx - 1
+                # Start a still segment
+                current_segment_start = i
                 current_segment_type = 'still'
             elif current_segment_type is None:
-                # Starting with a still segment
+                # Start from the beginning as still
                 current_segment_type = 'still'
-            # If already in 'still', continue
+            # If already 'still', just continue
         else:
-            # Current frame is different from the previous frame
+            # Frames differ
             if current_segment_type == 'still':
                 # Close the current still segment
                 segments.append(Segment(
                     segment_type='still',
                     start_frame=current_segment_start,
-                    end_frame=frame_idx - 1
+                    end_frame=i
                 ))
-                # Start a new animation segment
-                current_segment_start = frame_idx - 1
+                # Start an animation segment
+                current_segment_start = i
                 current_segment_type = 'animation'
             elif current_segment_type is None:
-                # Starting with an animation segment
+                # Start as animation
                 current_segment_type = 'animation'
-            # If already in 'animation', continue
+            # If already 'animation', just continue
 
-        prev_frame = next_frame
+    # Close the last segment
+    last_frame_index = len(frames) - 1
+    if current_segment_type is not None:
+        segments.append(Segment(
+            segment_type=current_segment_type,
+            start_frame=current_segment_start,
+            end_frame=last_frame_index
+        ))
 
-    cap.release()
     return segments
 
 def map_segments_to_timestamps(segments: List[Segment], fps: float):
@@ -116,36 +139,38 @@ def cut_segments_with_ffmpeg(video_path: str, segments: List[dict], output_dir: 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    for idx, seg in enumerate(segments):
-        segment_type = seg['type']
-        start_time = seg['start_time']
-        duration = seg['duration']
-        out_file = os.path.join(output_dir, f"segment_{idx:03d}_{segment_type}.mp4")
+    # Initialize tqdm progress bar for cutting segments
+    with tqdm(total=len(segments), desc="Cutting Segments", unit="segment") as pbar:
+        for idx, seg in enumerate(segments):
+            segment_type = seg['type']
+            start_time = seg['start_time']
+            duration = seg['duration']
+            out_file = os.path.join(output_dir, f"segment_{idx:03d}_{segment_type}.mp4")
 
-        # ffmpeg command to cut without re-encoding
-        # Using -c copy attempts to avoid re-encoding.
-        # Note: frame-accurate cuts may require additional steps depending on your source format.
-        cmd = [
-            "ffmpeg",
-            "-y",  # Overwrite output files without asking
-            "-i", video_path,
-            "-ss", f"{start_time:.3f}",
-            "-t", f"{duration:.3f}",
-            "-c", "copy",
-            out_file
-        ]
+            cmd = [
+                "ffmpeg",
+                "-y",  # Overwrite output files without asking
+                "-i", video_path,
+                "-ss", f"{start_time:.3f}",
+                "-t", f"{duration:.3f}",
+                "-c", "copy",
+                out_file
+            ]
 
-        print(f"Processing segment {idx+1}/{len(segments)}: {segment_type}")
-        print("Running command:", " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            print(f"Segment saved to: {out_file}\n")
-        except subprocess.CalledProcessError as e:
-            print(f"Error processing segment {idx}: {e.stderr.decode()}")
-            print("Skipping this segment.\n")
+            # Optional: You can comment out the next line if you don't want to see the ffmpeg commands
+            # print(f"Running command: {' '.join(cmd)}")
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                # Optionally, you can print the progress
+                # print(f"Segment saved to: {out_file}")
+            except subprocess.CalledProcessError as e:
+                print(f"Error processing segment {idx}: {e.stderr.decode()}")
+                print("Skipping this segment.")
+            finally:
+                pbar.update(1)
 
 def main():
-    parser = argparse.ArgumentParser(description="Segment video into still and animation parts.")
+    parser = argparse.ArgumentParser(description="Segment video into still and animation parts with progress bars.")
     parser.add_argument("video", help="Path to the input video file.")
     parser.add_argument("-o", "--output", default="cuts", help="Output directory for segments.")
     args = parser.parse_args()
@@ -167,9 +192,16 @@ def main():
         print(f"Error retrieving video properties: {e}")
         return
 
+    print("Loading all frames into memory...")
+    try:
+        frames = load_all_frames(video_path, total_frames)
+    except Exception as e:
+        print(f"Error loading frames: {e}")
+        return
+
     print("Segmenting video based on frame differences...")
     try:
-        segments = segment_video(video_path, fps, total_frames)
+        segments = segment_video(frames)
         print(f"Identified {len(segments)} segments.\n")
     except Exception as e:
         print(f"Error during segmentation: {e}")
