@@ -256,7 +256,7 @@ def finalize_segments(
 def purge_short_animation_segments(segments: List[Segment]) -> List[Segment]:
     """
     Remove animation segments that are exactly 2 frames long by reassigning their frames
-    to adjacent 'still' segments.
+    to separate 'still' segments.
 
     Args:
         segments: List of initial segments.
@@ -272,27 +272,13 @@ def purge_short_animation_segments(segments: List[Segment]) -> List[Segment]:
             f1 = seg.start_frame
             f2 = seg.end_frame
 
-            # Assign f1 to previous 'still' segment if exists
-            if new_segments and new_segments[-1].segment_type == 'still':
-                # Extend the previous 'still' segment to include f1
-                new_segments[-1].end_frame = f1
-            else:
-                # Create a new 'still' segment for f1
-                new_segments.append(Segment('still', f1, f1))
+            # Assign f1 to a new 'still' segment
+            new_segments.append(Segment('still', f1, f1))
 
-            # Assign f2 to next 'still' segment if exists
-            if (i + 1) < len(segments) and segments[i + 1].segment_type == 'still':
-                next_seg = segments[i + 1]
-                # Extend or create 'still' segment with f2
-                if new_segments and new_segments[-1].segment_type == 'still' and new_segments[-1].end_frame + 1 == f2:
-                    # Merge with the previous 'still' segment
-                    new_segments[-1].end_frame = f2
-                else:
-                    new_segments.append(Segment('still', f2, next_seg.end_frame))
-                i += 1  # Skip the next segment as it's handled
-            else:
-                # Create a new 'still' segment for f2
-                new_segments.append(Segment('still', f2, f2))
+            # Assign f2 to a new 'still' segment
+            new_segments.append(Segment('still', f2, f2))
+
+            i += 1  # Skip the animation segment
         else:
             # Keep the segment as is
             new_segments.append(seg)
