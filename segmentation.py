@@ -246,11 +246,58 @@ def finalize_segments(
     """
     if current_segment_type is not None and current_segment_start is not None:
         segments.append(Segment(
-            segment_type=current_segment_type,
-            start_frame=current_segment_start,
-            end_frame=last_frame_index
+            current_segment_type,
+            current_segment_start,
+            last_frame_index
         ))
     return segments
+
+
+def purge_short_animation_segments(segments: List[Segment]) -> List[Segment]:
+    """
+    Remove animation segments that are exactly 2 frames long by reassigning their frames
+    to adjacent 'still' segments.
+
+    Args:
+        segments: List of initial segments.
+
+    Returns:
+        Updated list of segments with short animation segments purged.
+    """
+    new_segments = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        if seg.segment_type == 'animation' and (seg.end_frame - seg.start_frame + 1) == 2:
+            f1 = seg.start_frame
+            f2 = seg.end_frame
+
+            # Assign f1 to previous 'still' segment if exists
+            if new_segments and new_segments[-1].segment_type == 'still':
+                # Extend the previous 'still' segment to include f1
+                new_segments[-1].end_frame = f1
+            else:
+                # Create a new 'still' segment for f1
+                new_segments.append(Segment('still', f1, f1))
+
+            # Assign f2 to next 'still' segment if exists
+            if (i + 1) < len(segments) and segments[i + 1].segment_type == 'still':
+                next_seg = segments[i + 1]
+                # Extend or create 'still' segment with f2
+                if new_segments and new_segments[-1].segment_type == 'still' and new_segments[-1].end_frame + 1 == f2:
+                    # Merge with the previous 'still' segment
+                    new_segments[-1].end_frame = f2
+                else:
+                    new_segments.append(Segment('still', f2, next_seg.end_frame))
+                i += 1  # Skip the next segment as it's handled
+            else:
+                # Create a new 'still' segment for f2
+                new_segments.append(Segment('still', f2, f2))
+        else:
+            # Keep the segment as is
+            new_segments.append(seg)
+        i += 1
+    return new_segments
 
 
 def map_segments_to_timestamps(segments: List[Segment], fps: float):
@@ -451,6 +498,9 @@ def main():
     segments = finalize_segments(
         segments, current_segment_type, current_segment_start, total_frames - 1
     )
+
+    # Purge short animation segments (exactly 2 frames)
+    segments = purge_short_animation_segments(segments)
 
     print(f"Identified {len(segments)} segments.\n")
 
