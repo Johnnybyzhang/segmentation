@@ -1,4 +1,5 @@
 import os
+import math
 import cv2
 import subprocess
 import argparse
@@ -41,7 +42,7 @@ def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, execu
     - executor: A ProcessPoolExecutor for parallel comparisons
 
     Returns:
-    - results: List of booleans for each comparison in this chunk (including prev_frame if provided)
+    - results: List of booleans for each comparison in this chunk (including the prev_frame if provided)
     - last_frame_index: The index of the last frame in this chunk
     """
     if prev_frame is not None:
@@ -52,8 +53,13 @@ def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, execu
     # Prepare frame pairs
     frame_pairs = [(combined_frames[i], combined_frames[i+1]) for i in range(len(combined_frames)-1)]
 
-    # Parallel comparison
-    results = list(executor.map(compare_two_frames, frame_pairs))
+    # Parallel comparison with a progress bar for just this chunk
+    # The length of frame_pairs is equal to len(frames) + (1 if prev_frame is not None else 0) - 1
+    with tqdm(total=len(frame_pairs), desc="Comparing chunk frames", unit="comparison", leave=False) as pbar:
+        results = []
+        for result in executor.map(compare_two_frames, frame_pairs):
+            results.append(result)
+            pbar.update(1)
 
     last_frame_index = start_frame_index + len(frames) - 1
     return results, last_frame_index
@@ -63,26 +69,17 @@ def update_segments(segments: List[Segment], results: List[bool], prev_frame_ind
     """
     Update segments based on the results of a chunk.
     results: boolean list of comparisons
-    prev_frame_index: The index of the frame before the first frame in this chunk (None if none)
+    prev_frame_index: The index of the frame before this chunk (None if first chunk)
     start_frame_index: The index of the first frame in this chunk
     current_segment_type, current_segment_start: segment state carried over from previous chunks
 
     Returns updated segments, current_segment_type, current_segment_start.
     """
-    # The indexing of frames for results:
-    # If prev_frame_index is not None:
-    #   results[0] compares prev_frame_index and start_frame_index
-    #   results[1] compares start_frame_index and start_frame_index+1
-    #   ...
-    # If prev_frame_index is None (first chunk):
-    #   results[0] compares start_frame_index and start_frame_index+1
-    #   results[i] compares (start_frame_index+i) and (start_frame_index+i+1)
-
     for i, identical in enumerate(results):
         if prev_frame_index is not None:
-            # The pair of frames for results[i]:
-            # difference i=0: (prev_frame_index, start_frame_index)
-            # difference i>0: (start_frame_index+(i-1), start_frame_index+i)
+            # results indexing:
+            # i=0: compares prev_frame_index and start_frame_index
+            # i>0: compares start_frame_index+(i-1) and start_frame_index+i
             if i == 0:
                 f1 = prev_frame_index
                 f2 = start_frame_index
@@ -90,12 +87,12 @@ def update_segments(segments: List[Segment], results: List[bool], prev_frame_ind
                 f1 = start_frame_index + (i - 1)
                 f2 = start_frame_index + i
         else:
-            # No prev frame:
-            # results[i]: (start_frame_index+i, start_frame_index+i+1)
+            # If no prev_frame_index:
+            # results[i]: compares (start_frame_index+i) and (start_frame_index+i+1)
             f1 = start_frame_index + i
             f2 = start_frame_index + i + 1
 
-        # Update segments logic
+        # Segment logic
         if identical:
             # frames f1 and f2 are identical
             if current_segment_type == 'animation':
@@ -194,13 +191,16 @@ def main():
         print(f"Error retrieving video properties: {e}")
         return
 
-    # Open video capture
+    if total_frames == 0:
+        print("No frames found in the video.")
+        return
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Cannot open video file: {video_path}")
         return
 
-    total_comparisons = max(0, total_frames - 1)  # number of frame-to-frame comparisons
+    num_chunks = math.ceil(total_frames / chunk_size)
     segments = []
     current_segment_type = None
     current_segment_start = None
@@ -209,48 +209,58 @@ def main():
     prev_frame_index = None
 
     frame_index = 0
+
     with ProcessPoolExecutor() as executor:
-        with tqdm(total=total_comparisons, desc="Comparing Frames", unit="comparison") as pbar:
-            while True:
-                # Read up to chunk_size frames
-                frames = []
-                for _ in range(chunk_size):
+        for chunk_number in range(num_chunks):
+            # Calculate chunk boundaries
+            chunk_start_frame = frame_index
+            chunk_end_frame = min(chunk_start_frame + chunk_size - 1, total_frames - 1)
+            this_chunk_size = (chunk_end_frame - chunk_start_frame + 1)
+
+            # Calculate global progress
+            global_progress = (chunk_number + 1) / num_chunks * 100
+            print(f"Processing chunk {chunk_number+1} out of {num_chunks}, total progress: {global_progress:.2f}%")
+
+            # Load frames for this chunk with a progress bar
+            frames = []
+            with tqdm(total=this_chunk_size, desc="Loading chunk frames", unit="frame", leave=False) as pbar:
+                for _ in range(this_chunk_size):
                     ret, frame = cap.read()
                     if not ret:
                         break
                     frames.append(frame)
+                    pbar.update(1)
 
-                if len(frames) == 0:
-                    # No more frames
-                    break
+            if len(frames) == 0:
+                # No more frames
+                break
 
-                # Process this chunk
-                chunk_start_frame = frame_index
-                results, last_frame_index = process_chunk(frames, prev_frame, prev_frame_index, chunk_start_frame, executor)
+            # Process this chunk
+            results, last_frame_index = process_chunk(frames, prev_frame, prev_frame_index, chunk_start_frame, executor)
 
-                # Update segments with these results
-                segments, current_segment_type, current_segment_start = update_segments(
-                    segments, 
-                    results, 
-                    prev_frame_index, 
-                    chunk_start_frame,
-                    current_segment_type, 
-                    current_segment_start
-                )
+            # Update segments with these results
+            segments, current_segment_type, current_segment_start = update_segments(
+                segments,
+                results,
+                prev_frame_index,
+                chunk_start_frame,
+                current_segment_type,
+                current_segment_start
+            )
 
-                # Update progress bar
-                pbar.update(len(results))
+            # Prepare for next chunk
+            prev_frame = frames[-1]
+            prev_frame_index = last_frame_index
+            frame_index = last_frame_index + 1
 
-                # Prepare for next chunk
-                prev_frame = frames[-1]
-                prev_frame_index = last_frame_index
-                frame_index = last_frame_index + 1
+            # Release memory by clearing frames and results references
+            frames = None
+            results = None
 
     cap.release()
 
     # Finalize segments
-    if total_frames > 0:
-        segments = finalize_segments(segments, current_segment_type, current_segment_start, total_frames - 1)
+    segments = finalize_segments(segments, current_segment_type, current_segment_start, total_frames - 1)
 
     print(f"Identified {len(segments)} segments.\n")
 
@@ -264,3 +274,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
