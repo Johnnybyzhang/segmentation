@@ -31,6 +31,20 @@ def compare_two_frames(frame1, frame2):
     """Compare two frames for exact equality."""
     return (frame1 == frame2).all()
 
+def compare_frame_pairs_subchunk(frame_pairs_sublist):
+    """Compare a sublist of frame pairs and return the list of boolean results."""
+    return [compare_two_frames(f1, f2) for (f1, f2) in frame_pairs_sublist]
+
+def split_into_subchunks(data, n_subchunks):
+    """Split the data list into n_subchunks as evenly as possible."""
+    length = len(data)
+    if n_subchunks <= 0 or n_subchunks > length:
+        # If n_subchunks is larger than data length, just return one chunk
+        return [data]
+
+    chunk_size = math.ceil(length / n_subchunks)
+    return [data[i:i+chunk_size] for i in range(0, length, chunk_size)]
+
 def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, executor, workers):
     """
     Process a single chunk of frames in parallel:
@@ -39,7 +53,7 @@ def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, execu
     - prev_frame_index: The frame index of prev_frame in the global sequence
     - start_frame_index: The index of the first frame in this chunk
     - executor: A ProcessPoolExecutor for parallel comparisons
-    - workers: number of parallel workers (for informational prints)
+    - workers: number of parallel workers
 
     Returns:
     - results: List of booleans for each comparison in this chunk
@@ -50,36 +64,73 @@ def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, execu
     else:
         combined_frames = frames
 
-    # Prepare frame pairs (each will be processed in parallel)
+    # Prepare frame pairs
     frame_pairs = [(combined_frames[i], combined_frames[i+1]) for i in range(len(combined_frames)-1)]
     n_pairs = len(frame_pairs)
 
-    # Submit tasks to the executor
+    # Divide frame_pairs into sub-chunks (for example, as many as workers)
+    subchunks = split_into_subchunks(frame_pairs, workers)
+
+    # We'll have one future per sub-chunk
     futures = []
-    with tqdm(total=n_pairs, desc="Comparing chunk frames", unit="comparison", leave=False) as pbar:
-        for f1, f2 in frame_pairs:
-            future = executor.submit(compare_two_frames, f1, f2)
+    total_pairs = sum(len(sc) for sc in subchunks)
+    with tqdm(total=total_pairs, desc="Comparing chunk frames", unit="comparison", leave=False) as pbar:
+        for sc in subchunks:
+            future = executor.submit(compare_frame_pairs_subchunk, sc)
             futures.append(future)
 
         results = []
-        # As tasks complete, update the progress bar
+        # As tasks complete, extend results and update progress
         for f in as_completed(futures):
-            res = f.result()
-            results.append(res)
-            pbar.update(1)
+            sub_results = f.result()
+            results.extend(sub_results)
+            pbar.update(len(sub_results))
+
+    # Ensure results are in the correct order:
+    # as_completed doesn't guarantee order, but since each subchunk corresponds
+    # to a contiguous range of frame_pairs, we can reassemble them in order.
+    # We'll assume subchunks are processed in order and reconstructed accordingly.
+    # If order matters, we need to track chunk indices.
+    # For simplicity, we rely on the order of subchunks to reassemble the results.
+    # Let's store them in a list of (index, results).
+    # Actually, to ensure correct ordering, let's modify the code to store chunk index:
+
+def process_chunk(frames, prev_frame, prev_frame_index, start_frame_index, executor, workers):
+    if prev_frame is not None:
+        combined_frames = [prev_frame] + frames
+    else:
+        combined_frames = frames
+
+    frame_pairs = [(combined_frames[i], combined_frames[i+1]) for i in range(len(combined_frames)-1)]
+    n_pairs = len(frame_pairs)
+
+    subchunks = split_into_subchunks(frame_pairs, workers)
+    futures = []
+    total_pairs = sum(len(sc) for sc in subchunks)
+
+    # Keep track of subchunk index to reconstruct order
+    for idx, sc in enumerate(subchunks):
+        futures.append((idx, executor.submit(compare_frame_pairs_subchunk, sc)))
+
+    results_ordered = [None] * len(subchunks)
+    with tqdm(total=total_pairs, desc="Comparing chunk frames", unit="comparison", leave=False) as pbar:
+        for idx, f in futures:
+            sub_results = f.result()
+            results_ordered[idx] = sub_results
+            pbar.update(len(sub_results))
+
+    # Flatten results in original order
+    results = [r for sublist in results_ordered for r in sublist]
 
     last_frame_index = start_frame_index + len(frames) - 1
     return results, last_frame_index
 
+# The rest of the code remains unchanged from previous versions:
 def update_segments(segments: List[Segment], results: List[bool], prev_frame_index: Optional[int], start_frame_index: int,
                     current_segment_type: Optional[str], current_segment_start: Optional[int]):
-    """
-    Update segments based on the results of a chunk.
-    """
     for i, identical in enumerate(results):
         if prev_frame_index is not None:
-            # i=0: compares prev_frame_index and start_frame_index
-            # i>0: compares start_frame_index+(i-1) and start_frame_index+i
+            # results indexing logic
             if i == 0:
                 f1 = prev_frame_index
                 f2 = start_frame_index
@@ -87,25 +138,19 @@ def update_segments(segments: List[Segment], results: List[bool], prev_frame_ind
                 f1 = start_frame_index + (i - 1)
                 f2 = start_frame_index + i
         else:
-            # If no prev_frame_index:
-            # results[i] compares (start_frame_index+i) and (start_frame_index+i+1)
             f1 = start_frame_index + i
             f2 = start_frame_index + i + 1
 
         if identical:
-            # frames f1 and f2 are identical
             if current_segment_type == 'animation':
-                # Close the animation segment at f1
-                segments.append(Segment(segment_type='animation', start_frame=current_segment_start, end_frame=f1))
+                segments.append(Segment('animation', current_segment_start, f1))
                 current_segment_start = f1
                 current_segment_type = 'still'
             elif current_segment_type is None:
                 current_segment_type = 'still'
         else:
-            # frames differ
             if current_segment_type == 'still':
-                # Close the still segment at f1
-                segments.append(Segment(segment_type='still', start_frame=current_segment_start, end_frame=f1))
+                segments.append(Segment('still', current_segment_start, f1))
                 current_segment_start = f1
                 current_segment_type = 'animation'
             elif current_segment_type is None:
@@ -114,15 +159,8 @@ def update_segments(segments: List[Segment], results: List[bool], prev_frame_ind
     return segments, current_segment_type, current_segment_start
 
 def finalize_segments(segments: List[Segment], current_segment_type: Optional[str], current_segment_start: Optional[int], last_frame_index: int):
-    """
-    Close the last open segment after processing all chunks.
-    """
     if current_segment_type is not None:
-        segments.append(Segment(
-            segment_type=current_segment_type,
-            start_frame=current_segment_start,
-            end_frame=last_frame_index
-        ))
+        segments.append(Segment(current_segment_type, current_segment_start, last_frame_index))
     return segments
 
 def map_segments_to_timestamps(segments: List[Segment], fps: float):
@@ -166,11 +204,11 @@ def cut_segments_with_ffmpeg(video_path: str, segments: List[dict], output_dir: 
             pbar.update(1)
 
 def main():
-    parser = argparse.ArgumentParser(description="Segment video into still and animation parts with parallel processing.")
+    parser = argparse.ArgumentParser(description="Segment video into still and animation parts with parallel sub-chunking.")
     parser.add_argument("video", help="Path to the input video file.")
     parser.add_argument("-o", "--output", default="cuts", help="Output directory for segments.")
     parser.add_argument("-c", "--chunk-size", type=int, default=512, help="Number of frames to process per chunk.")
-    parser.add_argument("-w", "--workers", type=int, default=16, help="Number of parallel workers for frame comparison.")
+    parser.add_argument("-w", "--workers", type=int, default=16, help="Number of parallel workers (processes) for frame comparison.")
     args = parser.parse_args()
 
     video_path = args.video
@@ -214,7 +252,6 @@ def main():
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         for chunk_number in range(num_chunks):
-            # Calculate chunk boundaries
             chunk_start_frame = frame_index
             chunk_end_frame = min(chunk_start_frame + chunk_size - 1, total_frames - 1)
             this_chunk_size = (chunk_end_frame - chunk_start_frame + 1)
@@ -233,13 +270,10 @@ def main():
                     pbar.update(1)
 
             if len(frames) == 0:
-                # No more frames
                 break
 
-            # Process this chunk in parallel
             results, last_frame_index = process_chunk(frames, prev_frame, prev_frame_index, chunk_start_frame, executor, workers)
 
-            # Update segments with these results
             segments, current_segment_type, current_segment_start = update_segments(
                 segments,
                 results,
@@ -249,18 +283,16 @@ def main():
                 current_segment_start
             )
 
-            # Prepare for next chunk
             prev_frame = frames[-1]
             prev_frame_index = last_frame_index
             frame_index = last_frame_index + 1
 
-            # Release memory
+            # Release references
             frames = None
             results = None
 
     cap.release()
 
-    # Finalize segments
     segments = finalize_segments(segments, current_segment_type, current_segment_start, total_frames - 1)
 
     print(f"Identified {len(segments)} segments.\n")
